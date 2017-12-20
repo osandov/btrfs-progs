@@ -74,6 +74,35 @@ static int wait_for_subvolume_cleaning(int fd, size_t count, uint64_t *ids,
 	return 0;
 }
 
+static int qgroup_inherit_add_group(struct btrfs_util_qgroup_inherit **inherit,
+				    const char *arg)
+{
+	enum btrfs_util_error err;
+	u64 qgroupid;
+
+	if (!*inherit) {
+		err = btrfs_util_create_qgroup_inherit(0, inherit);
+		if (err) {
+			error_btrfs_util(err);
+			return -1;
+		}
+	}
+
+	qgroupid = parse_qgroupid(optarg);
+	if (qgroupid == 0) {
+		error("invalid qgroup specification, qgroupid must not be 0");
+		return -1;
+	}
+
+	err = btrfs_util_qgroup_inherit_add_group(inherit, qgroupid);
+	if (err) {
+		error_btrfs_util(err);
+		return -1;
+	}
+
+	return 0;
+}
+
 static const char * const subvolume_cmd_group_usage[] = {
 	"btrfs subvolume <command> <args>",
 	NULL
@@ -92,15 +121,9 @@ static const char * const cmd_subvol_create_usage[] = {
 
 static int cmd_subvol_create(int argc, char **argv)
 {
-	int	retval, res, len;
-	int	fddst = -1;
-	char	*dupname = NULL;
-	char	*dupdir = NULL;
-	char	*newname;
-	char	*dstdir;
-	char	*dst;
-	struct btrfs_qgroup_inherit *inherit = NULL;
-	DIR	*dirstream = NULL;
+	struct btrfs_util_qgroup_inherit *inherit = NULL;
+	enum btrfs_util_error err;
+	int retval = 1;
 
 	optind = 0;
 	while (1) {
@@ -110,11 +133,8 @@ static int cmd_subvol_create(int argc, char **argv)
 
 		switch (c) {
 		case 'i':
-			res = qgroup_inherit_add_group(&inherit, optarg);
-			if (res) {
-				retval = res;
+			if (qgroup_inherit_add_group(&inherit, optarg) == -1)
 				goto out;
-			}
 			break;
 		default:
 			usage(cmd_subvol_create_usage);
@@ -124,71 +144,18 @@ static int cmd_subvol_create(int argc, char **argv)
 	if (check_argc_exact(argc - optind, 1))
 		usage(cmd_subvol_create_usage);
 
-	dst = argv[optind];
+	printf("Create subvolume '%s'\n", argv[optind]);
 
-	retval = 1;	/* failure */
-	res = test_isdir(dst);
-	if (res < 0 && res != -ENOENT) {
-		errno = -res;
-		error("cannot access %s: %m", dst);
-		goto out;
-	}
-	if (res >= 0) {
-		error("target path already exists: %s", dst);
+	err = btrfs_util_create_subvolume(argv[optind], 0, NULL, inherit);
+	if (err) {
+		error_btrfs_util(err);
 		goto out;
 	}
 
-	dupname = strdup(dst);
-	newname = basename(dupname);
-	dupdir = strdup(dst);
-	dstdir = dirname(dupdir);
-
-	if (!test_issubvolname(newname)) {
-		error("invalid subvolume name: %s", newname);
-		goto out;
-	}
-
-	len = strlen(newname);
-	if (len > BTRFS_VOL_NAME_MAX) {
-		error("subvolume name too long: %s", newname);
-		goto out;
-	}
-
-	fddst = btrfs_open_dir(dstdir, &dirstream, 1);
-	if (fddst < 0)
-		goto out;
-
-	printf("Create subvolume '%s/%s'\n", dstdir, newname);
-	if (inherit) {
-		struct btrfs_ioctl_vol_args_v2	args;
-
-		memset(&args, 0, sizeof(args));
-		strncpy_null(args.name, newname);
-		args.flags |= BTRFS_SUBVOL_QGROUP_INHERIT;
-		args.size = qgroup_inherit_size(inherit);
-		args.qgroup_inherit = inherit;
-
-		res = ioctl(fddst, BTRFS_IOC_SUBVOL_CREATE_V2, &args);
-	} else {
-		struct btrfs_ioctl_vol_args	args;
-
-		memset(&args, 0, sizeof(args));
-		strncpy_null(args.name, newname);
-
-		res = ioctl(fddst, BTRFS_IOC_SUBVOL_CREATE, &args);
-	}
-
-	if (res < 0) {
-		error("cannot create subvolume: %m");
-		goto out;
-	}
-
-	retval = 0;	/* success */
+	retval = 0;
 out:
-	close_file_or_dir(fddst, dirstream);
-	free(inherit);
-	free(dupname);
-	free(dupdir);
+	if (inherit)
+		btrfs_util_destroy_qgroup_inherit(inherit);
 
 	return retval;
 }
@@ -622,18 +589,16 @@ static int cmd_subvol_snapshot(int argc, char **argv)
 	char	*subvol, *dst;
 	int	res, retval;
 	int	fd = -1, fddst = -1;
-	int	len, readonly = 0;
 	char	*dupname = NULL;
 	char	*dupdir = NULL;
 	char	*newname;
 	char	*dstdir;
 	enum btrfs_util_error err;
-	struct btrfs_ioctl_vol_args_v2	args;
-	struct btrfs_qgroup_inherit *inherit = NULL;
+	struct btrfs_util_qgroup_inherit *inherit = NULL;
 	DIR *dirstream1 = NULL, *dirstream2 = NULL;
+	int flags = 0;
 
-	memset(&args, 0, sizeof(args));
-	optind = 0;
+	retval = 1;	/* failure */
 	while (1) {
 		int c = getopt(argc, argv, "i:r");
 		if (c < 0)
@@ -641,14 +606,11 @@ static int cmd_subvol_snapshot(int argc, char **argv)
 
 		switch (c) {
 		case 'i':
-			res = qgroup_inherit_add_group(&inherit, optarg);
-			if (res) {
-				retval = res;
+			if (qgroup_inherit_add_group(&inherit, optarg) == -1)
 				goto out;
-			}
 			break;
 		case 'r':
-			readonly = 1;
+			flags |= BTRFS_UTIL_CREATE_SNAPSHOT_READ_ONLY;
 			break;
 		default:
 			usage(cmd_subvol_snapshot_usage);
@@ -661,7 +623,6 @@ static int cmd_subvol_snapshot(int argc, char **argv)
 	subvol = argv[optind];
 	dst = argv[optind + 1];
 
-	retval = 1;	/* failure */
 	err = btrfs_util_is_subvolume(subvol);
 	if (err) {
 		error_btrfs_util(err);
@@ -690,17 +651,6 @@ static int cmd_subvol_snapshot(int argc, char **argv)
 		dstdir = dirname(dupdir);
 	}
 
-	if (!test_issubvolname(newname)) {
-		error("invalid snapshot name '%s'", newname);
-		goto out;
-	}
-
-	len = strlen(newname);
-	if (len > BTRFS_VOL_NAME_MAX) {
-		error("snapshot name too long '%s'", newname);
-		goto out;
-	}
-
 	fddst = btrfs_open_dir(dstdir, &dirstream1, 1);
 	if (fddst < 0)
 		goto out;
@@ -709,8 +659,7 @@ static int cmd_subvol_snapshot(int argc, char **argv)
 	if (fd < 0)
 		goto out;
 
-	if (readonly) {
-		args.flags |= BTRFS_SUBVOL_RDONLY;
+	if (flags & BTRFS_UTIL_CREATE_SNAPSHOT_READ_ONLY) {
 		printf("Create a readonly snapshot of '%s' in '%s/%s'\n",
 		       subvol, dstdir, newname);
 	} else {
@@ -718,18 +667,10 @@ static int cmd_subvol_snapshot(int argc, char **argv)
 		       subvol, dstdir, newname);
 	}
 
-	args.fd = fd;
-	if (inherit) {
-		args.flags |= BTRFS_SUBVOL_QGROUP_INHERIT;
-		args.size = qgroup_inherit_size(inherit);
-		args.qgroup_inherit = inherit;
-	}
-	strncpy_null(args.name, newname);
-
-	res = ioctl(fddst, BTRFS_IOC_SNAP_CREATE_V2, &args);
-
-	if (res < 0) {
-		error("cannot snapshot '%s': %m", subvol);
+	err = btrfs_util_create_snapshot_fd2(fd, fddst, newname, flags, NULL,
+					     inherit);
+	if (err) {
+		error_btrfs_util(err);
 		goto out;
 	}
 
@@ -738,7 +679,8 @@ static int cmd_subvol_snapshot(int argc, char **argv)
 out:
 	close_file_or_dir(fddst, dirstream1);
 	close_file_or_dir(fd, dirstream2);
-	free(inherit);
+	if (inherit)
+		btrfs_util_destroy_qgroup_inherit(inherit);
 	free(dupname);
 	free(dupdir);
 
