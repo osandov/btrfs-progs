@@ -90,7 +90,5 @@ struct btrfs_qgroup_comparer_set *btrfs_qgroup_alloc_comparer_set(void);
 int btrfs_qgroup_setup_comparer(struct btrfs_qgroup_comparer_set **comp_set,
 				enum btrfs_qgroup_comp_enum comparer,
 				int is_descending);
-int qgroup_inherit_size(struct btrfs_qgroup_inherit *p);
-int qgroup_inherit_add_group(struct btrfs_qgroup_inherit **inherit, char *arg);
 
 #endif
