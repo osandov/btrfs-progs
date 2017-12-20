@@ -104,18 +104,11 @@ static int cmd_subvol_create(int argc, char **argv)
 
 	optind = 0;
 	while (1) {
-		int c = getopt(argc, argv, "c:i:");
+		int c = getopt(argc, argv, "i:");
 		if (c < 0)
 			break;
 
 		switch (c) {
-		case 'c':
-			res = qgroup_inherit_add_copy(&inherit, optarg, 0);
-			if (res) {
-				retval = res;
-				goto out;
-			}
-			break;
 		case 'i':
 			res = qgroup_inherit_add_group(&inherit, optarg);
 			if (res) {
@@ -642,18 +635,11 @@ static int cmd_subvol_snapshot(int argc, char **argv)
 	memset(&args, 0, sizeof(args));
 	optind = 0;
 	while (1) {
-		int c = getopt(argc, argv, "c:i:r");
+		int c = getopt(argc, argv, "i:r");
 		if (c < 0)
 			break;
 
 		switch (c) {
-		case 'c':
-			res = qgroup_inherit_add_copy(&inherit, optarg, 0);
-			if (res) {
-				retval = res;
-				goto out;
-			}
-			break;
 		case 'i':
 			res = qgroup_inherit_add_group(&inherit, optarg);
 			if (res) {
@@ -663,13 +649,6 @@ static int cmd_subvol_snapshot(int argc, char **argv)
 			break;
 		case 'r':
 			readonly = 1;
-			break;
-		case 'x':
-			res = qgroup_inherit_add_copy(&inherit, optarg, 1);
-			if (res) {
-				retval = res;
-				goto out;
-			}
 			break;
 		default:
 			usage(cmd_subvol_snapshot_usage);
