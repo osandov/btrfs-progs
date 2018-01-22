@@ -82,6 +82,9 @@ wait for transaction commit at the end of the operation.
 -C|--commit-each::::
 wait for transaction commit after deleting each subvolume.
 +
+-R|--recursive::::
+delete subvolumes beneath each subvolume recursively.
++
 -v|--verbose::::
 verbose output of operations.
 
@@ -186,7 +189,7 @@ If no option is specified, subvolume information of <path> is shown,
 otherwise the subvolume information of rootid or UUID in the filesystem
 is shown.
 
-*snapshot* [-r|-i <qgroupid>] <source> <dest>|[<dest>/]<name>::
+*snapshot* [-r|-R] [-i <qgroupid>] <source> <dest>|[<dest>/]<name>::
 Create a snapshot of the subvolume <source> with the
 name <name> in the <dest> directory.
 +
@@ -201,6 +204,10 @@ Make the new snapshot read only.
 -i <qgroupid>::::
 Add the newly created subvolume to a qgroup. This option can be given multiple
 times.
++
+-R::::
+recursively snapshot subvolumes beneath the source. This option cannot be
+combined with -r.
 
 *sync* <path> [subvolid...]::
 Wait until given subvolume(s) are completely removed from the filesystem after
