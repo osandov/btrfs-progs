@@ -187,6 +187,7 @@ static const char * const cmd_subvol_delete_usage[] = {
 	"",
 	"-c|--commit-after      wait for transaction commit at the end of the operation",
 	"-C|--commit-each       wait for transaction commit after deleting each subvolume",
+	"-R|--recursive         delete subvolumes beneath each subvolume recursively",
 	"-v|--verbose           verbose output of operations",
 	NULL
 };
@@ -203,6 +204,7 @@ static int cmd_subvol_delete(int argc, char **argv)
 	DIR	*dirstream = NULL;
 	int verbose = 0;
 	int commit_mode = 0;
+	int flags = 0;
 	u8 fsid[BTRFS_FSID_SIZE];
 	char uuidbuf[BTRFS_UUID_UNPARSED_SIZE];
 	struct seen_fsid *seen_fsid_hash[SEEN_FSID_HASH_SIZE] = { NULL, };
@@ -214,11 +216,12 @@ static int cmd_subvol_delete(int argc, char **argv)
 		static const struct option long_options[] = {
 			{"commit-after", no_argument, NULL, 'c'},
 			{"commit-each", no_argument, NULL, 'C'},
+			{"recursive", no_argument, NULL, 'R'},
 			{"verbose", no_argument, NULL, 'v'},
 			{NULL, 0, NULL, 0}
 		};
 
-		c = getopt_long(argc, argv, "cCv", long_options, NULL);
+		c = getopt_long(argc, argv, "cCRv", long_options, NULL);
 		if (c < 0)
 			break;
 
@@ -228,6 +231,9 @@ static int cmd_subvol_delete(int argc, char **argv)
 			break;
 		case 'C':
 			commit_mode = COMMIT_EACH;
+			break;
+		case 'R':
+			flags |= BTRFS_UTIL_DELETE_SUBVOLUME_RECURSIVE;
 			break;
 		case 'v':
 			verbose++;
@@ -280,7 +286,7 @@ again:
 		commit_mode == COMMIT_EACH || (commit_mode == COMMIT_AFTER && cnt + 1 == argc)
 		? "commit" : "no-commit", dname, vname);
 
-	err = btrfs_util_delete_subvolume_fd(fd, vname, 0);
+	err = btrfs_util_delete_subvolume_fd(fd, vname, flags);
 	if (err) {
 		error_btrfs_util(err);
 		ret = 1;
@@ -569,13 +575,15 @@ out:
 }
 
 static const char * const cmd_subvol_snapshot_usage[] = {
-	"btrfs subvolume snapshot [-r] [-i <qgroupid>] <source> <dest>|[<dest>/]<name>",
+	"btrfs subvolume snapshot [-r|-R] [-i <qgroupid>] <source> <dest>|[<dest>/]<name>",
 	"Create a snapshot of the subvolume",
 	"Create a writable/readonly snapshot of the subvolume <source> with",
 	"the name <name> in the <dest> directory.  If only <dest> is given,",
 	"the subvolume will be named the basename of <source>.",
 	"",
 	"-r             create a readonly snapshot",
+	"-R             recursively snapshot subvolumes beneath the source; this",
+	"               option cannot be combined with -r",
 	"-i <qgroupid>  add the newly created snapshot to a qgroup. This",
 	"               option can be given multiple times.",
 	NULL
@@ -597,7 +605,7 @@ static int cmd_subvol_snapshot(int argc, char **argv)
 
 	retval = 1;	/* failure */
 	while (1) {
-		int c = getopt(argc, argv, "i:r");
+		int c = getopt(argc, argv, "i:rR");
 		if (c < 0)
 			break;
 
@@ -609,9 +617,18 @@ static int cmd_subvol_snapshot(int argc, char **argv)
 		case 'r':
 			flags |= BTRFS_UTIL_CREATE_SNAPSHOT_READ_ONLY;
 			break;
+		case 'R':
+			flags |= BTRFS_UTIL_CREATE_SNAPSHOT_RECURSIVE;
+			break;
 		default:
 			usage(cmd_subvol_snapshot_usage);
 		}
+	}
+
+	if ((flags & BTRFS_UTIL_CREATE_SNAPSHOT_READ_ONLY) &&
+	    (flags & BTRFS_UTIL_CREATE_SNAPSHOT_RECURSIVE)) {
+		error("-r and -R cannot be combined");
+		return 1;
 	}
 
 	if (check_argc_exact(argc - optind, 2))

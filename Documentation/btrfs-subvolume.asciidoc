@@ -81,6 +81,12 @@ wait for transaction commit at the end of the operation
 +
 -C|--commit-each::::
 wait for transaction commit after deleting each subvolume
++
+-R|--recursive::::
+delete subvolumes beneath each subvolume recursively
++
+-v|--verbose::::
+output more verbosely
 
 *find-new* <subvolume> <last_gen>::
 List the recently modified files in a subvolume, after <last_gen> ID.
@@ -157,7 +163,7 @@ The id can be obtained from *btrfs subvolume list*, *btrfs subvolume show* or
 *show* <path>::
 Show information of a given subvolume in the <path>.
 
-*snapshot* [-r] <source> <dest>|[<dest>/]<name>::
+*snapshot* [-r|-R] <source> <dest>|[<dest>/]<name>::
 Create a snapshot of the subvolume <source> with the
 name <name> in the <dest> directory.
 +
@@ -167,7 +173,11 @@ If <source> is not a subvolume, btrfs returns an error.
 `Options`
 +
 -r::::
-Make the new snapshot read only.
+make the new snapshot read-only
++
+-R::::
+recursively snapshot subvolumes beneath the source; this option cannot be
+combined with -r
 
 *sync* <path> [subvolid...]::
 Wait until given subvolume(s) are completely removed from the filesystem after
