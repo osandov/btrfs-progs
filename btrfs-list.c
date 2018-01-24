@@ -34,6 +34,12 @@
 #include "btrfs-list.h"
 #include "rbtree-utils.h"
 
+/*
+ * The deprecated functions in this file depend on each other, so silence the
+ * warnings.
+ */
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+
 /* we store all the roots we find in an rbtree so that we can
  * search for them later.
  */
