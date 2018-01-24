@@ -25,7 +25,6 @@
 #include <stdarg.h>
 #include "common-defs.h"
 #include "internal.h"
-#include "btrfs-list.h"
 #include "sizes.h"
 #include "messages.h"
 #include "ioctl.h"

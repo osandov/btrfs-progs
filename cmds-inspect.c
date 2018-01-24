@@ -23,6 +23,8 @@
 #include <getopt.h>
 #include <limits.h>
 
+#include <btrfsutil.h>
+
 #include "kerncompat.h"
 #include "ioctl.h"
 #include "utils.h"
@@ -30,7 +32,6 @@
 #include "send-utils.h"
 #include "disk-io.h"
 #include "commands.h"
-#include "btrfs-list.h"
 #include "help.h"
 
 static const char * const inspect_cmd_group_usage[] = {
@@ -147,6 +148,7 @@ static int cmd_inspect_logical_resolve(int argc, char **argv)
 	char full_path[PATH_MAX];
 	char *path_ptr;
 	DIR *dirstream = NULL;
+	enum btrfs_util_error err;
 
 	while (1) {
 		int c = getopt(argc, argv, "Pvs:");
@@ -219,9 +221,9 @@ static int cmd_inspect_logical_resolve(int argc, char **argv)
 		DIR *dirs = NULL;
 
 		if (getpath) {
-			name = btrfs_list_path_for_root(fd, root);
-			if (IS_ERR(name)) {
-				ret = PTR_ERR(name);
+			err = btrfs_util_subvolume_path_fd(fd, root, &name);
+			if (err) {
+				ret = -errno;
 				goto out;
 			}
 			if (!name) {

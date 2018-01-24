@@ -39,12 +39,13 @@
 #include <sys/xattr.h>
 #include <uuid/uuid.h>
 
+#include <btrfsutil.h>
+
 #include "ctree.h"
 #include "ioctl.h"
 #include "commands.h"
 #include "utils.h"
 #include "list.h"
-#include "btrfs-list.h"
 
 #include "send.h"
 #include "send-stream.h"
@@ -1086,12 +1087,13 @@ static struct btrfs_send_ops send_ops = {
 static int do_receive(struct btrfs_receive *rctx, const char *tomnt,
 		      char *realmnt, int r_fd, u64 max_errors)
 {
-	u64 subvol_id;
+	uint64_t subvol_id;
 	int ret;
 	char *dest_dir_full_path;
 	char root_subvol_path[PATH_MAX];
 	int end = 0;
 	int iterations = 0;
+	enum btrfs_util_error err;
 
 	dest_dir_full_path = realpath(tomnt, NULL);
 	if (!dest_dir_full_path) {
@@ -1136,9 +1138,12 @@ static int do_receive(struct btrfs_receive *rctx, const char *tomnt,
 	 * subvolume we're sitting in so that we can adjust the paths of any
 	 * subvols we want to receive in.
 	 */
-	ret = btrfs_list_get_path_rootid(rctx->mnt_fd, &subvol_id);
-	if (ret)
+	err = btrfs_util_subvolume_id_fd(rctx->mnt_fd, &subvol_id);
+	if (err) {
+		error_btrfs_util(err);
+		ret = -1;
 		goto out;
+	}
 
 	root_subvol_path[0] = 0;
 	ret = btrfs_subvolid_resolve(rctx->mnt_fd, root_subvol_path,

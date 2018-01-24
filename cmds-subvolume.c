@@ -1376,13 +1376,14 @@ static int cmd_subvol_list(int argc, char **argv)
 	struct btrfs_list_comparer_set *comparer_set;
 	u64 flags = 0;
 	int fd = -1;
-	u64 top_id;
+	uint64_t top_id;
 	int ret = -1, uerr = 0;
 	char *subvol;
 	int is_list_all = 0;
 	int is_only_in_path = 0;
 	DIR *dirstream = NULL;
 	enum btrfs_list_layout layout = BTRFS_LIST_LAYOUT_DEFAULT;
+	enum btrfs_util_error err;
 
 	filter_set = btrfs_list_alloc_filter_set();
 	comparer_set = btrfs_list_alloc_comparer_set();
@@ -1495,9 +1496,12 @@ static int cmd_subvol_list(int argc, char **argv)
 		btrfs_list_setup_filter(&filter_set, BTRFS_LIST_FILTER_FLAGS,
 					flags);
 
-	ret = btrfs_list_get_path_rootid(fd, &top_id);
-	if (ret)
+	err = btrfs_util_subvolume_id_fd(fd, &top_id);
+	if (err) {
+		error_btrfs_util(err);
+		ret = 1;
 		goto out;
+	}
 
 	if (is_list_all)
 		btrfs_list_setup_filter(&filter_set,

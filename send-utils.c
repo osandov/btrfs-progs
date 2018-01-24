@@ -23,10 +23,11 @@
 #include <limits.h>
 #include <errno.h>
 
+#include <btrfsutil.h>
+
 #include "ctree.h"
 #include "send-utils.h"
 #include "ioctl.h"
-#include "btrfs-list.h"
 
 static int btrfs_subvolid_resolve_sub(int fd, char *path, size_t *path_len,
 				      u64 subvol_id);
@@ -36,6 +37,8 @@ static int btrfs_get_root_id_by_sub_path(int mnt_fd, const char *sub_path,
 {
 	int ret;
 	int subvol_fd;
+	uint64_t id;
+	enum btrfs_util_error err;
 
 	subvol_fd = openat(mnt_fd, sub_path, O_RDONLY);
 	if (subvol_fd < 0) {
@@ -45,7 +48,13 @@ static int btrfs_get_root_id_by_sub_path(int mnt_fd, const char *sub_path,
 		return ret;
 	}
 
-	ret = btrfs_list_get_path_rootid(subvol_fd, root_id);
+	err = btrfs_util_subvolume_id_fd(subvol_fd, &id);
+	if (err) {
+		ret = -errno;
+	} else {
+		*root_id = id;
+		ret = 0;
+	}
 	close(subvol_fd);
 	return ret;
 }
@@ -574,6 +583,7 @@ int subvol_uuid_search_init(int mnt_fd, struct subvol_uuid_search *s)
 	unsigned long off = 0;
 	int i;
 	char *path;
+	enum btrfs_util_error err;
 
 	s->mnt_fd = mnt_fd;
 
@@ -646,12 +656,11 @@ int subvol_uuid_search_init(int mnt_fd, struct subvol_uuid_search *s)
 				if (!root_item_valid)
 					goto skip;
 
-				path = btrfs_list_path_for_root(mnt_fd,
-					btrfs_search_header_objectid(sh));
-				if (!path)
-					path = strdup("");
-				if (IS_ERR(path)) {
-					ret = PTR_ERR(path);
+				err = btrfs_util_subvolume_path_fd(mnt_fd,
+								   btrfs_search_header_objectid(sh),
+								   &path);
+				if (err) {
+					ret = -errno;
 					fprintf(stderr, "ERROR: unable to "
 							"resolve path "
 							"for root %llu\n",
