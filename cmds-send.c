@@ -52,6 +52,7 @@
  * the 'At subvol' message.
  */
 static int g_verbose = 1;
+static int g_stream_version = BTRFS_SEND_STREAM_VERSION_1;
 
 struct btrfs_send {
 	int send_fd;
@@ -343,6 +344,8 @@ static int do_send(struct btrfs_send *send, u64 parent_root_id,
 		io_send.flags |= BTRFS_SEND_FLAG_OMIT_STREAM_HEADER;
 	if (!is_last_subvol)
 		io_send.flags |= BTRFS_SEND_FLAG_OMIT_END_CMD;
+	if (g_stream_version == BTRFS_SEND_STREAM_VERSION_2)
+		io_send.flags |= BTRFS_SEND_FLAG_STREAM_V2;
 	ret = ioctl(subvol_fd, BTRFS_IOC_SEND, &io_send);
 	if (ret < 0) {
 		ret = -errno;
@@ -514,7 +517,8 @@ int cmd_send(int argc, char **argv)
 		static const struct option long_options[] = {
 			{ "verbose", no_argument, NULL, 'v' },
 			{ "quiet", no_argument, NULL, 'q' },
-			{ "no-data", no_argument, NULL, GETOPT_VAL_SEND_NO_DATA }
+			{ "no-data", no_argument, NULL, GETOPT_VAL_SEND_NO_DATA },
+			{ "stream-version", 1, NULL, 'V' },
 		};
 		int c = getopt_long(argc, argv, "vqec:f:i:p:", long_options, NULL);
 
@@ -599,6 +603,24 @@ int cmd_send(int argc, char **argv)
 			error("option -i was removed, use -c instead");
 			ret = 1;
 			goto out;
+		case 'V':
+			if (sscanf(optarg, "%d", &g_stream_version) != 1) {
+				fprintf(stderr,
+					"ERROR: invalid value for stream version: %s\n",
+					optarg);
+				ret = 1;
+				goto out;
+			}
+			if (g_stream_version <= 0 ||
+			    g_stream_version > BTRFS_SEND_STREAM_VERSION_LATEST) {
+				fprintf(stderr,
+					"ERROR: unsupported stream version %d, minimum: 1, maximum: %d\n",
+					g_stream_version,
+					BTRFS_SEND_STREAM_VERSION_LATEST);
+				ret = 1;
+				goto out;
+			}
+			break;
 		case GETOPT_VAL_SEND_NO_DATA:
 			send_flags |= BTRFS_SEND_FLAG_NO_FILE_DATA;
 			break;
@@ -777,7 +799,7 @@ out:
 }
 
 const char * const cmd_send_usage[] = {
-	"btrfs send [-ve] [-p <parent>] [-c <clone-src>] [-f <outfile>] <subvol> [<subvol>...]",
+	"btrfs send [-ve] [--stream-version <version>] [-p <parent>] [-c <clone-src>] [-f <outfile>] <subvol> [<subvol>...]",
 	"Send the subvolume(s) to stdout.",
 	"Sends the subvolume(s) specified by <subvol> to stdout.",
 	"<subvol> should be read-only here.",
@@ -791,21 +813,24 @@ const char * const cmd_send_usage[] = {
 	"which case 'btrfs send' will determine a suitable parent among the",
 	"clone sources itself.",
 	"\n",
-	"-e               If sending multiple subvols at once, use the new",
-	"                 format and omit the end-cmd between the subvols.",
-	"-p <parent>      Send an incremental stream from <parent> to",
-	"                 <subvol>.",
-	"-c <clone-src>   Use this snapshot as a clone source for an ",
-	"                 incremental send (multiple allowed)",
-	"-f <outfile>     Output is normally written to stdout. To write to",
-	"                 a file, use this option. An alternative would be to",
-	"                 use pipes.",
-	"--no-data        send in NO_FILE_DATA mode, Note: the output stream",
-	"                 does not contain any file data and thus cannot be used",
-	"                 to transfer changes. This mode is faster and useful to",
-	"                 show the differences in metadata.",
-	"-v|--verbose     enable verbose output to stderr, each occurrence of",
-	"                 this option increases verbosity",
-	"-q|--quiet       suppress all messages, except errors",
+	"-e                          If sending multiple subvols at once, use the new",
+	"                            format and omit the end-cmd between the subvols.",
+	"-p <parent>                 Send an incremental stream from <parent> to",
+	"                            <subvol>.",
+	"-c <clone-src>              Use this snapshot as a clone source for an ",
+	"                            incremental send (multiple allowed)",
+	"-f <outfile>                Output is normally written to stdout. To write to",
+	"                            a file, use this option. An alternative would be to",
+	"                            use pipes.",
+	"--no-data                   send in NO_FILE_DATA mode, Note: the output stream",
+	"                            does not contain any file data and thus cannot be used",
+	"                            to transfer changes. This mode is faster and useful to",
+	"                            show the differences in metadata.",
+	"-v|--verbose                enable verbose output to stderr, each occurrence of",
+	"                            this option increases verbosity",
+	"-q|--quiet       	     suppress all messages, except errors",
+	"--stream-version <version>  Ask the kernel to produce a specific send stream",
+	"                            version. More recent stream versions provide new",
+	"                            features and better performance. Default value is 1.",
 	NULL
 };
