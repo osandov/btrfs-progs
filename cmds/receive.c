@@ -30,14 +30,20 @@
 #include <assert.h>
 #include <getopt.h>
 #include <limits.h>
+#include <errno.h>
 
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/ioctl.h>
 #include <sys/time.h>
 #include <sys/types.h>
+#include <sys/uio.h>
 #include <sys/xattr.h>
 #include <uuid/uuid.h>
+
+#include <lzo/lzo1x.h>
+#include <zlib.h>
+#include <zstd.h>
 
 #include "ctree.h"
 #include "ioctl.h"
@@ -52,6 +58,7 @@
 #include "send-dump.h"
 #include "common/help.h"
 #include "common/path-utils.h"
+#include "stubs.h"
 
 struct btrfs_receive
 {
@@ -60,6 +67,7 @@ struct btrfs_receive
 
 	int write_fd;
 	char write_path[PATH_MAX];
+	int write_fd_allow_encoded;
 
 	char *root_path;
 	char *dest_dir_path; /* relative to root_path */
@@ -78,6 +86,8 @@ struct btrfs_receive
 
 	int honor_end_cmd;
 
+	int force_decompress;
+
 	/*
 	 * Buffer to store capabilities from security.capabilities xattr,
 	 * usually 20 bytes, but make same room for potentially larger
@@ -85,6 +95,10 @@ struct btrfs_receive
 	 */
 	char cached_capabilities[64];
 	int cached_capabilities_len;
+
+	/* Reuse stream objects for encoded_write decompression fallback */
+	ZSTD_DStream *zstd_dstream;
+	z_stream *zlib_stream;
 };
 
 static int finish_subvol(struct btrfs_receive *rctx)
@@ -643,24 +657,65 @@ out:
 	return ret;
 }
 
-static int open_inode_for_write(struct btrfs_receive *rctx, const char *path)
+static int set_write_fd_allow_encoded(struct btrfs_receive *rctx)
+{
+	int ret;
+	int flags;
+
+	flags = fcntl(rctx->write_fd, F_GETFL);
+	if (flags < 0) {
+		ret = -errno;
+		error("failed to fetch old fd flags");
+		goto close_fd;
+	}
+	ret = fcntl(rctx->write_fd, F_SETFL, flags | O_ALLOW_ENCODED);
+	if (ret < 0) {
+		ret = -errno;
+		error("failed to enable encoded writes");
+		goto close_fd;
+	}
+	rctx->write_fd_allow_encoded = true;
+	ret = 0;
+	goto out;
+close_fd:
+	close(rctx->write_fd);
+	rctx->write_fd = -1;
+	rctx->write_fd_allow_encoded = false;
+out:
+	return ret;
+}
+
+static int open_inode_for_write(struct btrfs_receive *rctx, const char *path,
+				bool allow_encoded)
 {
 	int ret = 0;
+	int flags = O_RDWR;
 
 	if (rctx->write_fd != -1) {
-		if (strcmp(rctx->write_path, path) == 0)
+		/*
+		 * if the existing fd is for this path and the needed flags are
+		 * satisfied, no need to open a new one
+		 */
+		if (strcmp(rctx->write_path, path) == 0) {
+			/* fixup the allow encoded flag, if necessary */
+			if (allow_encoded && !rctx->write_fd_allow_encoded)
+				ret = set_write_fd_allow_encoded(rctx);
 			goto out;
+		}
 		close(rctx->write_fd);
 		rctx->write_fd = -1;
 	}
 
-	rctx->write_fd = open(path, O_RDWR);
+	if (allow_encoded)
+		flags |= O_ALLOW_ENCODED;
+	rctx->write_fd = open(path, flags);
 	if (rctx->write_fd < 0) {
 		ret = -errno;
 		error("cannot open %s: %m", path);
 		goto out;
 	}
 	strncpy_null(rctx->write_path, path);
+	rctx->write_fd_allow_encoded = allow_encoded;
 
 out:
 	return ret;
@@ -691,7 +746,7 @@ static int process_write(const char *path, const void *data, u64 offset,
 		goto out;
 	}
 
-	ret = open_inode_for_write(rctx, full_path);
+	ret = open_inode_for_write(rctx, full_path, false);
 	if (ret < 0)
 		goto out;
 
@@ -734,7 +789,7 @@ static int process_clone(const char *path, u64 offset, u64 len,
 		goto out;
 	}
 
-	ret = open_inode_for_write(rctx, full_path);
+	ret = open_inode_for_write(rctx, full_path, false);
 	if (ret < 0)
 		goto out;
 
@@ -1028,6 +1083,328 @@ static int process_update_extent(const char *path, u64 offset, u64 len,
 	return 0;
 }
 
+static int decompress_zlib(struct btrfs_receive *rctx, const void *encoded_data,
+			   u64 encoded_len, char *unencoded_data,
+			   u64 unencoded_len)
+{
+	int status = 0;
+	bool init = false;
+	int ret;
+
+	if (!rctx->zlib_stream) {
+		init = true;
+		rctx->zlib_stream = malloc(sizeof(z_stream));
+		if (!rctx->zlib_stream) {
+			error("failed to allocate zlib stream %m");
+			status = -ENOMEM;
+			goto out;
+		}
+	}
+	rctx->zlib_stream->next_in = (void *)encoded_data;
+	rctx->zlib_stream->avail_in = encoded_len;
+	rctx->zlib_stream->next_out = (void *)unencoded_data;
+	rctx->zlib_stream->avail_out = unencoded_len;
+
+	if (!init)
+		ret = inflateReset(rctx->zlib_stream);
+	else {
+		rctx->zlib_stream->zalloc = Z_NULL;
+		rctx->zlib_stream->zfree = Z_NULL;
+		rctx->zlib_stream->opaque = Z_NULL;
+		ret = inflateInit(rctx->zlib_stream);
+	}
+	if (ret != Z_OK) {
+		error("zlib inflate init failed %d", ret);
+		status = -EIO;
+		goto out;
+	}
+
+	while (rctx->zlib_stream->avail_in > 0 &&
+	       rctx->zlib_stream->avail_out > 0) {
+		ret = inflate(rctx->zlib_stream, Z_FINISH);
+		if (ret == Z_STREAM_END) {
+			break;
+		} else if (ret != Z_OK) {
+			error("zlib inflate failed %d", ret);
+			status = -EIO;
+			break;
+		}
+	}
+out:
+	return status;
+}
+
+static int decompress_lzo(const void *encoded_data, u64 encoded_len,
+			  char *unencoded_data, u64 unencoded_len)
+{
+	uint32_t total_len;
+	size_t in_pos, out_pos;
+
+	if (encoded_len < 4) {
+		error("lzo header is truncated");
+		return -EIO;
+	}
+	memcpy(&total_len, encoded_data, 4);
+	total_len = le32toh(total_len);
+	if (total_len > encoded_len) {
+		error("lzo header is invalid");
+		return -EIO;
+	}
+
+	in_pos = 4;
+	out_pos = 0;
+	while (in_pos < total_len && out_pos < unencoded_len) {
+		uint32_t src_len;
+		lzo_uint dst_len = unencoded_len - out_pos;
+		int ret;
+
+		if (total_len - in_pos < 4) {
+			error("lzo segment header is truncated");
+			return -EIO;
+		}
+		memcpy(&src_len, encoded_data + in_pos, 4);
+		src_len = le32toh(src_len);
+		in_pos += 4;
+		if (src_len > total_len - in_pos) {
+			error("lzo segment header is invalid\n");
+			return -EIO;
+		}
+
+		ret = lzo1x_decompress_safe((void *)(encoded_data + in_pos),
+			src_len, (void *)(unencoded_data + out_pos), &dst_len,
+			NULL);
+		if (ret != LZO_E_OK) {
+			error("lzo1x_decompress_safe failed: %d", ret);
+			return -EIO;
+		}
+
+		in_pos += src_len;
+		out_pos += dst_len;
+	}
+	return 0;
+}
+
+static int decompress_zstd(struct btrfs_receive *rctx, const void *encoded_buf,
+			   u64 encoded_len, char *unencoded_buf,
+			   u64 unencoded_len)
+{
+	ZSTD_inBuffer in_buf = {
+		.src = encoded_buf,
+		.size = encoded_len
+	};
+	ZSTD_outBuffer out_buf = {
+		.dst = unencoded_buf,
+		.size = unencoded_len
+	};
+	int status = 0;
+	size_t ret;
+
+	if (!rctx->zstd_dstream) {
+		rctx->zstd_dstream = ZSTD_createDStream();
+		if (!rctx->zstd_dstream) {
+			error("failed to create zstd dstream");
+			status = -ENOMEM;
+			goto out;
+		}
+	}
+	ret = ZSTD_initDStream(rctx->zstd_dstream);
+	if (ZSTD_isError(ret)) {
+		error("failed to init zstd stream %s", ZSTD_getErrorName(ret));
+		status = -EIO;
+		goto out;
+	}
+	while (in_buf.pos < in_buf.size && out_buf.pos < out_buf.size) {
+		ret = ZSTD_decompressStream(rctx->zstd_dstream, &out_buf, &in_buf);
+		if (ret == 0) {
+			break;
+		} else if (ZSTD_isError(ret)) {
+			error("failed to decompress zstd stream: %s",
+			      ZSTD_getErrorName(ret));
+			status = -EIO;
+			goto out;
+		}
+	}
+
+out:
+	return status;
+}
+
+static int decompress_and_write(const void *encoded_data, u64 encoded_len,
+				u64 unencoded_file_len, u64 unencoded_len,
+				u64 unencoded_offset, u32 compression,
+				void *user)
+{
+	int ret = 0;
+	size_t pos;
+	ssize_t w;
+	struct btrfs_receive *rctx = user;
+	char *unencoded_data;
+
+	unencoded_data = calloc(unencoded_len, sizeof(*unencoded_data));
+	if (!unencoded_data) {
+		error("allocating space for unencoded data failed: %m");
+		return -errno;
+	}
+
+	switch (compression) {
+	case ENCODED_IOV_COMPRESSION_ZLIB:
+		ret = decompress_zlib(rctx, encoded_data, encoded_len,
+				  unencoded_data, unencoded_len);
+		if (ret)
+			goto out;
+		break;
+	case ENCODED_IOV_COMPRESSION_LZO:
+		ret = decompress_lzo(encoded_data, encoded_len,
+				 unencoded_data, unencoded_len);
+		if (ret)
+			goto out;
+		break;
+	case ENCODED_IOV_COMPRESSION_ZSTD:
+		ret = decompress_zstd(rctx, encoded_data, encoded_len,
+				  unencoded_data, unencoded_len);
+		if (ret)
+			goto out;
+		break;
+	}
+
+	pos = unencoded_offset;
+	while (pos < unencoded_file_len) {
+		w = pwrite(rctx->write_fd, unencoded_data + pos,
+			   unencoded_file_len - pos, unencoded_offset + pos);
+		if (w < 0) {
+			ret = -errno;
+			error("writing unencoded data failed: %m");
+			goto out;
+		}
+		pos += w;
+	}
+out:
+	free(unencoded_data);
+	return ret;
+}
+
+static int process_encoded_write(const char *path, const void *data, u64 offset,
+				 u64 len, u64 unencoded_file_len,
+				 u64 unencoded_len, u64 unencoded_offset,
+				 u32 compression, u32 encryption, void *user)
+{
+	int ret;
+	struct btrfs_receive *rctx = user;
+	char full_path[PATH_MAX];
+	struct encoded_iov encoded = {
+		.len = unencoded_file_len,
+		.unencoded_len = unencoded_len,
+		.unencoded_offset = unencoded_offset,
+		.compression = compression,
+		.encryption = encryption,
+	};
+	struct iovec iov[2] = {
+		{ &encoded, sizeof(encoded) },
+		{ (char *)data, len }
+	};
+	bool encoded_write = !rctx->force_decompress;
+	bool decompress = rctx->force_decompress;
+
+	if (encryption) {
+		error("encoded_write: encryption not supported\n");
+		ret = -EOPNOTSUPP;
+		goto out;
+	}
+
+	ret = path_cat_out(full_path, rctx->full_subvol_path, path);
+	if (ret < 0) {
+		error("encoded_write: path invalid: %s", path);
+		goto out;
+	}
+
+	ret = open_inode_for_write(rctx, full_path, true);
+	if (ret < 0)
+		goto out;
+
+	if (encoded_write) {
+		/*
+		 * NOTE: encoded writes guarantee no partial writes,
+		 * so we don't need to handle that possibility.
+		 */
+		ret = pwritev2(rctx->write_fd, iov, 2, offset, RWF_ENCODED);
+		if (ret < 0) {
+			/*
+			 * error conditions where fallback to manual decompress
+			 * and write make sense.
+			 */
+			if (errno == ENOSPC ||
+			    errno == EOPNOTSUPP ||
+			    errno == EINVAL)
+				decompress = true;
+			else {
+				ret = -errno;
+				error("encoded_write: writing to %s failed: %m", path);
+				goto out;
+			}
+		}
+	}
+
+	if (decompress) {
+		ret = decompress_and_write(data, len, unencoded_file_len,
+				unencoded_len, unencoded_offset,
+				compression, user);
+		if (ret < 0)
+			goto out;
+	}
+	ret = 0;
+out:
+	return ret;
+}
+
+static int process_fallocate(const char *path, int mode, u64 offset, u64 len,
+			     void *user)
+{
+	int ret;
+	struct btrfs_receive *rctx = user;
+	char full_path[PATH_MAX];
+
+	ret = path_cat_out(full_path, rctx->full_subvol_path, path);
+	if (ret < 0) {
+		error("fallocate: path invalid: %s", path);
+		goto out;
+	}
+	ret = open_inode_for_write(rctx, full_path, false);
+	if (ret < 0)
+		goto out;
+	ret = fallocate(rctx->write_fd, mode, offset, len);
+	if (ret < 0) {
+		ret = -errno;
+		error("fallocate: fallocate on %s failed: %m", path);
+		goto out;
+	}
+out:
+	return ret;
+}
+
+static int process_setflags(const char *path, int flags, void *user)
+{
+	int ret;
+	struct btrfs_receive *rctx = user;
+	char full_path[PATH_MAX];
+
+	ret = path_cat_out(full_path, rctx->full_subvol_path, path);
+	if (ret < 0) {
+		error("setflags: path invalid: %s", path);
+		goto out;
+	}
+	ret = open_inode_for_write(rctx, full_path, false);
+	if (ret < 0)
+		goto out;
+	ret = ioctl(rctx->write_fd, FS_IOC_SETFLAGS, &flags);
+	if (ret < 0) {
+		ret = -errno;
+		error("setflags: setflags ioctl on %s failed: %m", path);
+		goto out;
+	}
+out:
+	return ret;
+}
+
 static struct btrfs_send_ops send_ops = {
 	.subvol = process_subvol,
 	.snapshot = process_snapshot,
@@ -1050,6 +1427,9 @@ static struct btrfs_send_ops send_ops = {
 	.chown = process_chown,
 	.utimes = process_utimes,
 	.update_extent = process_update_extent,
+	.encoded_write = process_encoded_write,
+	.fallocate = process_fallocate,
+	.setflags = process_setflags,
 };
 
 static int do_receive(struct btrfs_receive *rctx, const char *tomnt,
@@ -1212,6 +1592,12 @@ out:
 		close(rctx->dest_dir_fd);
 		rctx->dest_dir_fd = -1;
 	}
+	if (rctx->zstd_dstream)
+		ZSTD_freeDStream(rctx->zstd_dstream);
+	if (rctx->zlib_stream) {
+		inflateEnd(rctx->zlib_stream);
+		free(rctx->zlib_stream);
+	}
 
 	return ret;
 }
@@ -1285,12 +1671,13 @@ static int cmd_receive(const struct cmd_struct *cmd, int argc, char **argv)
 	optind = 0;
 	while (1) {
 		int c;
-		enum { GETOPT_VAL_DUMP = 257 };
+		enum { GETOPT_VAL_DUMP = 257, GETOPT_VAL_FORCE_DECOMPRESS };
 		static const struct option long_opts[] = {
 			{ "max-errors", required_argument, NULL, 'E' },
 			{ "chroot", no_argument, NULL, 'C' },
 			{ "dump", no_argument, NULL, GETOPT_VAL_DUMP },
 			{ "quiet", no_argument, NULL, 'q' },
+			{ "force-decompress", no_argument, NULL, GETOPT_VAL_FORCE_DECOMPRESS },
 			{ NULL, 0, NULL, 0 }
 		};
 
@@ -1332,6 +1719,9 @@ static int cmd_receive(const struct cmd_struct *cmd, int argc, char **argv)
 			break;
 		case GETOPT_VAL_DUMP:
 			dump = 1;
+			break;
+		case GETOPT_VAL_FORCE_DECOMPRESS:
+			rctx.force_decompress = 1;
 			break;
 		default:
 			usage_unknown_option(cmd, argv);
