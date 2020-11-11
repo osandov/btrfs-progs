@@ -654,7 +654,11 @@ static int open_inode_for_write(struct btrfs_receive *rctx, const char *path)
 		rctx->write_fd = -1;
 	}
 
-	rctx->write_fd = open(path, O_RDWR);
+	/*
+	 * When opening with O_ALLOW_ENCODED, O_CLOEXEC must also be specified.
+	 * We might as well always use it even though we don't exec anything.
+	 */
+	rctx->write_fd = open(path, O_RDWR | O_CLOEXEC);
 	if (rctx->write_fd < 0) {
 		ret = -errno;
 		error("cannot open %s: %m", path);
